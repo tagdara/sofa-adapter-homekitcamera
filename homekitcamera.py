@@ -35,6 +35,9 @@ import os
 import functools
 import concurrent.futures
 import uuid
+import pyqrcode
+import io
+#import pypng
 
 
 class homekit_camera(camera.Camera):
@@ -50,8 +53,8 @@ class homekit_camera(camera.Camera):
         self.cameraconfig={}
         self.cameraconfig['rtsp_uri']=''
         super().__init__(options, self.driver, self.device['friendlyName'])
-        self.motion=self.add_preload_service('MotionSensor')
-        self.char_detected = self.motion.configure_char('MotionDetected')
+        #self.motion=self.add_preload_service('MotionSensor')
+        #self.char_detected = self.motion.configure_char('MotionDetected')
         self.set_info_service( manufacturer=device['manufacturerName'], model=device['modelName'], firmware_revision='1.0', serial_number=device['endpointId'].split(':')[2])
         
     async def initialize_camera(self):
@@ -66,25 +69,34 @@ class homekit_camera(camera.Camera):
                 if stream['protocol']=='RTSP':
                     self.rtsp_uri=stream['uri']
                     self.cameraconfig['rtsp_uri']=stream['uri']
+                    self.log.info('rtsp: %s / %s' % (self.cameraconfig, self.rtsp_uri))
                     break
         except:
             self.log.error('!! Error initializing camera', exc_info=True)
 
     def blip(self):
-        self.log.info('<. Blipping motion detect for %s' % self.device['friendlyName'])
-        self.char_detected.set_value(True)
-        time.sleep(.2)
-        self.char_detected.set_value(False)
+        try:
+            if hasattr(self, 'char_detected'):
+                self.log.info('<. Blipping motion detect for %s' % self.device['friendlyName'])
+                self.char_detected.set_value(True)
+                time.sleep(.2)
+                self.char_detected.set_value(False)
+            else:
+                self.log.warn('.! Could not blip motion detect for %s.  No motion detector characteristic on camera.' % self.device['friendlyName'])
+        except:
+            self.log.error('!! Could not blip motion detect for %s.' % self.device['friendlyName'], exc_info=True)
         
     def _detected(self):
+        self.log.info('.. _detected')
         self.char_detected.set_value(True)
 
     def _notdetected(self):
+        self.log.info('.. _notdetected')
         self.char_detected.set_value(False)
 
     def get_snapshot(self, image_size):  # pylint: disable=unused-argument, no-self-use
         try:   
-            self.log.info('.. get snapshot: %s %s %s' % (image_size, self.imageuri, self.device))
+            self.log.info('<< get snapshot: %s %s %s' % (image_size, self.imageuri, self.device))
             future=asyncio.run_coroutine_threadsafe(self.get_snap(image_size['image-width']), loop=self.loop)
             return future.result() 
         except:
@@ -93,11 +105,12 @@ class homekit_camera(camera.Camera):
     async def get_snap(self, width):
 
         try:
+            self.log.info('.. Getting snap')
             async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(verify_ssl=False)) as client:
                 # need to have token security implemented for pulling thumbnails
                 async with client.get(self.imageuri) as response:
                     result=await response.read()
-                    self.log.info('Got snap: %s...' % result[:16])
+                    #self.log.info('Got snap: %s...' % result[:16])
                     return result  
         except:
             self.log.error('!! Error getting snap', exc_info=True)
@@ -168,7 +181,7 @@ class homekitcamera(sofabase):
                 ],
             },
             "srtp": True,
-            "address": "192.168.0.35",
+            "address": "192.168.0.11",
             "start_stream_cmd":  (
                 "ffmpeg -rtsp_transport http -re -i {rtsp_uri} "
                 "-vcodec libx264 -an -pix_fmt yuv420p -r {fps} -f rawvideo -tune zerolatency -vf scale={width}x{height} "
@@ -227,22 +240,22 @@ class homekitcamera(sofabase):
                 
         def addExtraLogs(self):
             
-            pass
+            #pass
         
-            #self.accessory_logger = logging.getLogger('pyhap.accessory_driver')
-            #self.accessory_logger.addHandler(self.log.handlers[0])
-            #self.accessory_logger.setLevel(logging.DEBUG)
+            self.accessory_logger = logging.getLogger('pyhap.accessory_driver')
+            self.accessory_logger.addHandler(self.log.handlers[0])
+            self.accessory_logger.setLevel(logging.DEBUG)
         
-            #self.accessory_driver_logger = logging.getLogger('pyhap.accessory_driver')
-            #self.accessory_driver_logger.addHandler(self.log.handlers[0])
-            #self.accessory_driver_logger.setLevel(logging.DEBUG)
+            self.accessory_driver_logger = logging.getLogger('pyhap.accessory_driver')
+            self.accessory_driver_logger.addHandler(self.log.handlers[0])
+            self.accessory_driver_logger.setLevel(logging.DEBUG)
 
-            #self.hap_server_logger = logging.getLogger('pyhap.hap_server')
-            #self.hap_server_logger.addHandler(self.log.handlers[0])
-            #self.hap_server_logger.setLevel(logging.DEBUG)
+            self.hap_server_logger = logging.getLogger('pyhap.hap_server')
+            self.hap_server_logger.addHandler(self.log.handlers[0])
+            self.hap_server_logger.setLevel(logging.DEBUG)
         
-            #self.log.setLevel(logging.DEBUG)   
-
+            self.log.setLevel(logging.DEBUG)   
+            
         async def virtualAddDevice(self, endpointId, obj):
             
             try:
@@ -267,6 +280,22 @@ class homekitcamera(sofabase):
                 await self.acc[cam].initialize_camera()
             except:
                 self.log.error('!! Error adding camera for %s' % endpointId, exc_info=True)
+
+        async def virtualImage(self, path, client=None):
+            
+            try:
+                if path.startswith('qrcode/'):
+                    acc_id=path.split('/')[1]
+                    if acc_id in self.acc:
+                        self.log.info('.. Generating QRcode for %s %s' % (self.acc[acc_id].display_name, self.acc[acc_id].xhm_uri()))
+                        qrcode = pyqrcode.create(self.acc[acc_id].xhm_uri())
+                        buffer = io.BytesIO()
+                        qrcode.png(buffer, scale=5, background=[0x77, 0x77, 0x77])
+                        return buffer.getvalue()
+            except:
+                self.log.error('!! error generating qrcode for %s' % path, exc_info=True)
+            return None
+
 
             
         async def virtualChangeHandler(self, deviceId, prop):
