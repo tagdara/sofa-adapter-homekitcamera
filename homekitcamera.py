@@ -6,8 +6,7 @@ sys.path.append(os.path.dirname(__file__))
 sys.path.append(os.path.join(os.path.dirname(__file__),'../../base'))
 from sofacollector import SofaCollector
 
-from sofabase import sofabase
-from sofabase import adapterbase
+from sofabase import sofabase, adapterbase, configbase
 import devices
 
 import math
@@ -105,8 +104,8 @@ class homekit_camera(camera.Camera):
     async def get_snap(self, width):
 
         try:
-            self.log.info('.. Getting snap')
-            async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(verify_ssl=False)) as client:
+            self.log.info('.. Getting snap: %s %s' % (self.adapter.token, self.imageuri))
+            async with aiohttp.ClientSession(connector=aiohttp.TCPConnector()) as client:
                 # need to have token security implemented for pulling thumbnails
                 async with client.get(self.imageuri) as response:
                     result=await response.read()
@@ -142,7 +141,13 @@ class homekit_camera(camera.Camera):
             self.log.error('Error starting stream', exc_info=True)
 
 class homekitcamera(sofabase):
-
+    
+    class adapter_config(configbase):
+    
+        def adapter_fields(self):
+            self.ffmpeg_address=self.set_or_default('ffmpeg_address', mandatory=True)
+            self.motion_map=self.set_or_default('motion_map', default={})
+            
     class adapterProcess(SofaCollector.collectorAdapter):
 
         # Specify the audio and video configuration that your device can support
@@ -188,10 +193,24 @@ class homekitcamera(sofabase):
                 "-b:v {v_max_bitrate}k -bufsize {v_max_bitrate}k -payload_type 99 -ssrc {v_ssrc} -f rtp -srtp_out_suite AES_CM_128_HMAC_SHA1_80 "
                 "-srtp_out_params {v_srtp_key} "
                 "srtp://{address}:{v_port}?rtcpport={v_port}&localrtcpport={v_port}&pkt_size=1378"
+            ),
+            "test_start_stream_cmd":  (
+                "ffmpeg -rtsp_transport http -re -i {rtsp_uri} "
+                "-vcodec copy -an -pix_fmt yuv420p -r {fps} -f rawvideo -tune zerolatency -vf scale={width}x{height} "
+                "-b:v {v_max_bitrate}k -bufsize {v_max_bitrate}k -payload_type 99 -ssrc {v_ssrc} -f rtp -srtp_out_suite AES_CM_128_HMAC_SHA1_80 "
+                "-srtp_out_params {v_srtp_key} "
+                "srtp://{address}:{v_port}?rtcpport={v_port}&localrtcpport={v_port}&pkt_size=1378"
             )
         }
+
+        @property
+        def collector_categories(self):
+            return ['CAMERA', 'MOTION_SENSOR', 'CONTACT_SENSOR']    
     
-        def __init__(self, log=None, loop=None, dataset=None, notify=None, request=None, executor=None,  **kwargs):
+        def __init__(self, log=None, loop=None, dataset=None, notify=None, request=None, executor=None, token=None, config=None, **kwargs):
+            self.config=config
+            self.drivers={}
+            self.acc={}
             self.dataset=dataset
             self.log=log
             self.notify=notify
@@ -199,6 +218,7 @@ class homekitcamera(sofabase):
             self.maxaid=8
             self.executor=executor
             self.portindex=0
+            self.token=token
             if not loop:
                 self.loop = asyncio.new_event_loop()
             else:
@@ -208,15 +228,12 @@ class homekitcamera(sofabase):
         async def start(self):
             
             try:
-                self.drivers={}
-                self.acc={}
                 asyncio.get_child_watcher()
-                self.log.info('Accessory Bridge Driver started')
+                self.log.info('..Accessory Bridge Driver started')
             except:
                 self.log.error('Error during startup', exc_info=True)
                 
         async def stop(self):
-            
             try:
                 self.log.info('!. Stopping Accessory Bridge Driver')
                 for drv in self.drivers:
@@ -226,12 +243,12 @@ class homekitcamera(sofabase):
                 self.log.error('!! Error stopping Accessory Bridge Driver', exc_info=True)
 
         def service_stop(self):
-            
             try:
                 self.log.info('!. Stopping Accessory Bridge Driver')
                 for drv in self.drivers:
                     self.log.info('.. Stopping driver %s...' % drv)
                     self.drivers[drv].stop()
+                    self.log.info('.. stopped: %s' % self.drivers[drv])
             except RuntimeError:
                 pass
             except:
@@ -239,9 +256,6 @@ class homekitcamera(sofabase):
 
                 
         def addExtraLogs(self):
-            
-            #pass
-        
             self.accessory_logger = logging.getLogger('pyhap.accessory_driver')
             self.accessory_logger.addHandler(self.log.handlers[0])
             self.accessory_logger.setLevel(logging.DEBUG)
@@ -255,9 +269,9 @@ class homekitcamera(sofabase):
             self.hap_server_logger.setLevel(logging.DEBUG)
         
             self.log.setLevel(logging.DEBUG)   
+ 
             
         async def virtualAddDevice(self, endpointId, obj):
-            
             try:
                 if 'CAMERA' in obj['displayCategories']:
                     await self.addAlexaCamera(obj)
@@ -268,21 +282,23 @@ class homekitcamera(sofabase):
         async def addAlexaCamera(self, device, imageuri=''):
             try:
                 cam=device['endpointId']
-                camid=device['endpointId'].split(':')[2]
-                self.drivers[cam] = AccessoryDriver(port=51830+self.portindex, persist_file='/opt/sofa-server/cache/homekitcamera-%s.json' % cam)
-                self.portindex=self.portindex+1
-                self.log.info('++ Adding Homekit Camera: %s PIN: %s' % (device['friendlyName'], self.drivers[cam].state.pincode))
-                self.options['address']=self.dataset.config['ffmpeg_address'] # seems like it must be an IP address for whatever reason
-                self.acc[cam] = homekit_camera(self.options, self, device, self.drivers[cam])
-                self.drivers[cam].add_accessory(accessory=self.acc[cam])
-                #signal.signal(signal.SIGTERM, self.drivers[cam].signal_handler)
-                self.executor.submit(self.drivers[cam].start)
-                await self.acc[cam].initialize_camera()
+                if cam not in self.acc:
+                    camid=device['endpointId'].split(':')[2]
+                    camport=51836+self.portindex
+                    self.drivers[cam] = AccessoryDriver(port=camport, persist_file='%s/homekitcamera-%s.json' % (self.config.cache_directory, cam))
+                    self.portindex=self.portindex+1                                                                         
+                    self.log.info('++ Adding Homekit Camera: %s Port: %s PIN: %s ' % (device['friendlyName'], camport, self.drivers[cam].state.pincode))
+                    self.options['address']=self.config.ffmpeg_address # seems like it must be an IP address for whatever reason
+                    self.acc[cam] = homekit_camera(self.options, self, device, self.drivers[cam])
+                    self.drivers[cam].add_accessory(accessory=self.acc[cam])
+                    #signal.signal(signal.SIGTERM, self.drivers[cam].signal_handler)
+                    self.executor.submit(self.drivers[cam].start)
+                    await self.acc[cam].initialize_camera()
             except:
                 self.log.error('!! Error adding camera for %s' % endpointId, exc_info=True)
 
+
         async def virtualImage(self, path, client=None):
-            
             try:
                 if path.startswith('qrcode/'):
                     acc_id=path.split('/')[1]
@@ -296,12 +312,10 @@ class homekitcamera(sofabase):
                 self.log.error('!! error generating qrcode for %s' % path, exc_info=True)
             return None
 
-
             
         async def virtualChangeHandler(self, deviceId, prop):
             # map open/close events to fake motion sense in order to send images through homekit notifications
-            devname=self.getfriendlyNamebyendpointId(deviceId)
-            maps=self.dataset.config['motionmap']
+            maps=self.config.motion_map
             try:
                 if deviceId in maps:
                     self.acc[maps[deviceId]].blip()
